@@ -372,7 +372,7 @@ export const Triki3DViewer: React.FC<Triki3DViewerProps> = ({
           // Pitch = rotation around X (tilting front/back)
           // Yaw = rotation around Y (spinning clockwise/counterclockwise)
           // Roll = rotation around Z (tilting left/right)
-          const radPitch = THREE.MathUtils.degToRad(pitch);
+          const radPitch = THREE.MathUtils.degToRad(-pitch);
           const radYaw = THREE.MathUtils.degToRad(-yaw);
           const radRoll = THREE.MathUtils.degToRad(-roll);
 
