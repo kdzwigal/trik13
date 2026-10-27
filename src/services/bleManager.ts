@@ -5,6 +5,8 @@
  * Based on Maku-hub/TrikiScope specifications
  */
 
+import { Capacitor } from '@capacitor/core';
+import { BleClient, ConnectionPriority } from '@capacitor-community/bluetooth-le';
 import { RawSensorSample, BLEConnectionState, LedCommand, ButtonMode, LedControlMethod } from '../types/triki';
 
 // Nordic UART Service UUIDs
@@ -60,6 +62,11 @@ export class TrikiBleManager {
   private txCharacteristic: BluetoothRemoteGATTCharacteristic | null = null;
   private rxCharacteristic: BluetoothRemoteGATTCharacteristic | null = null;
   private ledCharacteristic: BluetoothRemoteGATTCharacteristic | null = null;
+
+  // Native Capacitor BLE state (Android/iOS APK)
+  private nativeDeviceId: string | null = null;
+  private hasNativeRxChar: boolean = false;
+  private hasNativeLedChar: boolean = false;
 
   private onPacketCallback: PacketCallback | null = null;
   private onStateCallback: StateCallback | null = null;
@@ -166,7 +173,8 @@ export class TrikiBleManager {
     packetsReceived: 0,
     packetRateHz: 0,
     latencyMs: 0,
-    isWebBluetoothSupported: typeof navigator !== 'undefined' && 'bluetooth' in navigator,
+    isWebBluetoothSupported:
+      Capacitor.isNativePlatform() || (typeof navigator !== 'undefined' && 'bluetooth' in navigator),
     buttonMode: 'exact-01',
     buttonPressCount: 0,
     ledEnabled: false,
@@ -179,7 +187,7 @@ export class TrikiBleManager {
   }
 
   public isSupported(): boolean {
-    return typeof navigator !== 'undefined' && 'bluetooth' in navigator;
+    return Capacitor.isNativePlatform() || (typeof navigator !== 'undefined' && 'bluetooth' in navigator);
   }
 
   public getState(): BLEConnectionState {
@@ -285,9 +293,43 @@ export class TrikiBleManager {
   }
 
   /**
+   * Native Capacitor BLE write helper (Android/iOS)
+   */
+  private async writeNativeCharacteristic(charUuid: string, bytes: Uint8Array): Promise<void> {
+    if (!this.nativeDeviceId) {
+      throw new Error('Brak połączonego urządzenia natywnego BLE.');
+    }
+    const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    try {
+      await BleClient.write(this.nativeDeviceId, NUS_SERVICE_UUID, charUuid, dv);
+    } catch {
+      await BleClient.writeWithoutResponse(this.nativeDeviceId, NUS_SERVICE_UUID, charUuid, dv);
+    }
+  }
+
+  /**
    * Send the official Triki start command (20 10 00 D0 07 68 00 03) to NUS RX
    */
   public async sendStartCommand(): Promise<boolean> {
+    if (Capacitor.isNativePlatform()) {
+      if (!this.nativeDeviceId || !this.hasNativeRxChar) {
+        this.addLog('Błąd: Charakterystyka NUS RX (0x6E400002) nie jest dostępna');
+        return false;
+      }
+      try {
+        this.addLog('Wysyłanie komendy startowej (Natywne BLE): 20 10 00 D0 07 68 00 03...');
+        await this.writeNativeCharacteristic(NUS_RX_CHARACTERISTIC, TRIKI_START_COMMAND_BYTES);
+        this.addLog('Komenda startowa wysłana pomyślnie. Triki powinien rozpocząć nadawanie IMU.');
+        this.updateState({ lastCommandStatus: 'Wysłano komendę START (201000D007680003)' });
+        return true;
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        this.addLog(`Błąd zapisu do NUS RX: ${msg}`);
+        this.updateState({ lastCommandStatus: `Błąd zapisu START: ${msg}` });
+        return false;
+      }
+    }
+
     if (!this.rxCharacteristic) {
       this.addLog('Błąd: Charakterystyka NUS RX (0x6E400002) nie jest dostępna');
       return false;
@@ -308,11 +350,154 @@ export class TrikiBleManager {
   }
 
   /**
+   * Native Android / iOS BLE connection via @capacitor-community/bluetooth-le
+   */
+  private async connectNative(): Promise<void> {
+    try {
+      this.updateState({ status: 'searching', errorMessage: undefined });
+      this.addLog('[Android BLE] Inicjalizacja natywnego stosu Bluetooth LE...');
+
+      await BleClient.initialize({ androidNeverForLocation: true });
+
+      const enabled = await BleClient.isEnabled();
+      if (!enabled) {
+        this.addLog('[Android BLE] Bluetooth wyłączony — prośba o włączenie...');
+        try {
+          await BleClient.requestEnable();
+        } catch {
+          // User may enable manually or on older SDK
+        }
+      }
+
+      await BleClient.setDisplayStrings({
+        scanning: 'Skanowanie urządzeń BLE (Triki CAP001)...',
+        cancel: 'Anuluj',
+        availableDevices: 'Wybierz krążek Triki (CAP001)',
+        noDeviceFound: 'Nie wykryto urządzenia BLE w pobliżu',
+      });
+
+      this.addLog('[Android BLE] Otwieranie skanera urządzeń BLE...');
+      const device = await BleClient.requestDevice({
+        optionalServices: [
+          NUS_SERVICE_UUID,
+          '0000180f-0000-1000-8000-00805f9b34fb',
+          '0000180a-0000-1000-8000-00805f9b34fb',
+        ],
+      });
+
+      const deviceName = device.name || 'Triki Puck (CAP001)';
+      this.nativeDeviceId = device.deviceId;
+      this.addLog(`[Android BLE] Wybrano: ${deviceName} (${device.deviceId})`);
+
+      this.updateState({
+        status: 'connecting',
+        deviceName,
+        deviceId: device.deviceId,
+      });
+
+      await BleClient.connect(device.deviceId, () => {
+        this.handleDisconnect();
+      });
+      this.addLog('[Android BLE] Połączono z serwerem GATT.');
+
+      // Request high priority low-latency connection for ~98Hz IMU stream
+      try {
+        await BleClient.requestConnectionPriority(
+          device.deviceId,
+          ConnectionPriority.CONNECTION_PRIORITY_HIGH
+        );
+        this.addLog('[Android BLE] Ustawiono priorytet połączenia: HIGH (niskie opóźnienie IMU).');
+      } catch {
+        // Ignore if not supported
+      }
+
+      this.hasNativeRxChar = true;
+      this.hasNativeLedChar = false;
+
+      try {
+        const services = await BleClient.getServices(device.deviceId);
+        const nus = services.find((s) => s.uuid.toLowerCase() === NUS_SERVICE_UUID.toLowerCase());
+        if (!nus) {
+          throw new Error('Nie znaleziono serwisu Nordic UART (NUS 0x6E400001) w wybranym urządzeniu.');
+        }
+        this.addLog(`Wykryto ${nus.characteristics.length} charakterystyk GATT w serwisie NUS:`);
+        for (const c of nus.characteristics) {
+          const uuidLower = c.uuid.toLowerCase();
+          this.addLog(` • ${uuidLower}`);
+          if (uuidLower.includes('6e400002')) {
+            this.hasNativeRxChar = true;
+          } else if (uuidLower.includes('6e400004')) {
+            this.hasNativeLedChar = true;
+            this.addLog('   -> Zmapowano dedykowaną charakterystykę LED (0x6E400004)!');
+          }
+        }
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        if (msg.includes('Nie znaleziono serwisu Nordic UART')) {
+          throw e;
+        }
+        this.addLog(`Uwaga podczas skanowania charakterystyk: ${msg}`);
+      }
+
+      this.addLog('Włączanie powiadomień TX (startNotifications)...');
+      await BleClient.startNotifications(
+        device.deviceId,
+        NUS_SERVICE_UUID,
+        NUS_TX_CHARACTERISTIC,
+        (dataView: DataView) => {
+          const now = performance.now();
+          this.packetsCount++;
+          const sample = this.parsePacket(dataView, now);
+          if (sample && this.onPacketCallback) {
+            this.onPacketCallback(sample);
+          }
+        }
+      );
+      this.addLog('Powiadomienia TX włączone pomyślnie!');
+
+      this.packetsCount = 0;
+      this.lastPacketsCount = 0;
+      this.lastRateCalcTime = performance.now();
+
+      this.updateState({
+        status: 'connected',
+        serviceUuid: NUS_SERVICE_UUID,
+        errorMessage: undefined,
+      });
+
+      this.addLog('Wysyłanie inicjalizacyjnej komendy START do Triki...');
+      await this.sendStartCommand();
+
+      setTimeout(async () => {
+        if (this.nativeDeviceId && this.packetsCount === 0) {
+          this.addLog('Ponawianie komendy START po 300ms...');
+          await this.sendStartCommand();
+        }
+      }, 300);
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      this.addLog(`Błąd połączenia BLE: ${message}`);
+      this.updateState({
+        status: 'error',
+        errorMessage:
+          message.includes('cancelled') || message.includes('canceled')
+            ? 'Anulowano wybór urządzenia BLE.'
+            : message,
+      });
+      throw err;
+    }
+  }
+
+  /**
    * Request Bluetooth device and establish connection
    */
   public async connect(): Promise<void> {
+    if (Capacitor.isNativePlatform()) {
+      return this.connectNative();
+    }
+
     if (!this.isSupported()) {
-      const err = 'Web Bluetooth API nie jest obsługiwane w tej przeglądarce. Użyj Chrome, Edge lub Opera.';
+      const err = 'Web Bluetooth API nie jest obsługiwane w tej przeglądarce. Użyj Chrome, Edge lub aplikacji Android APK.';
       this.updateState({ status: 'error', errorMessage: err });
       throw new Error(err);
     }
@@ -469,6 +654,19 @@ export class TrikiBleManager {
    * Disconnect current device
    */
   public disconnect(): void {
+    if (Capacitor.isNativePlatform() && this.nativeDeviceId) {
+      const devId = this.nativeDeviceId;
+      this.nativeDeviceId = null;
+      BleClient.stopNotifications(devId, NUS_SERVICE_UUID, NUS_TX_CHARACTERISTIC).catch(() => {});
+      BleClient.disconnect(devId).catch(() => {});
+      this.addLog('Rozłączono natywne urządzenie BLE.');
+      this.updateState({
+        status: 'disconnected',
+        packetRateHz: 0,
+      });
+      return;
+    }
+
     if (this.txCharacteristic) {
       try {
         this.txCharacteristic.removeEventListener(
@@ -500,6 +698,7 @@ export class TrikiBleManager {
   }
 
   private handleDisconnect = (): void => {
+    this.nativeDeviceId = null;
     this.addLog('Urządzenie Triki rozłączyło się.');
     this.updateState({
       status: 'disconnected',
@@ -714,40 +913,76 @@ export class TrikiBleManager {
     let success = false;
     let targetsUsed: string[] = [];
 
-    // Method 1: Dedicated characteristic 6e400004
-    if ((method === 'char-6e400004' || method === 'auto' || method === 'both') && this.ledCharacteristic) {
-      try {
-        await this.writeCharacteristic(this.ledCharacteristic, byteVal);
-        targetsUsed.push('char 0x6E400004');
-        success = true;
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        this.addLog(`Błąd zapisu do 0x6E400004: ${msg}`);
+    if (Capacitor.isNativePlatform()) {
+      if ((method === 'char-6e400004' || method === 'auto' || method === 'both') && this.nativeDeviceId && this.hasNativeLedChar) {
+        try {
+          await this.writeNativeCharacteristic(NUS_LED_CHARACTERISTIC, byteVal);
+          targetsUsed.push('char 0x6E400004 (Native)');
+          success = true;
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          this.addLog(`Błąd zapisu do 0x6E400004: ${msg}`);
+        }
       }
-    }
 
-    // Method 2: NUS RX single byte 0x01 / 0x00
-    if ((method === 'nus-rx-01' || method === 'both' || (method === 'auto' && !success)) && this.rxCharacteristic) {
-      try {
-        await this.writeCharacteristic(this.rxCharacteristic, byteVal);
-        targetsUsed.push('NUS RX (0x01/0x00)');
-        success = true;
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        this.addLog(`Błąd zapisu byte do RX: ${msg}`);
+      if ((method === 'nus-rx-01' || method === 'both' || (method === 'auto' && !success)) && this.nativeDeviceId && this.hasNativeRxChar) {
+        try {
+          await this.writeNativeCharacteristic(NUS_RX_CHARACTERISTIC, byteVal);
+          targetsUsed.push('NUS RX (0x01/0x00 Native)');
+          success = true;
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          this.addLog(`Błąd zapisu byte do RX: ${msg}`);
+        }
       }
-    }
 
-    // Method 3: NUS RX vendor packet [0x20, 0x02, state]
-    if (method === 'nus-rx-vendor' && this.rxCharacteristic) {
-      try {
-        const vendorPayload = new Uint8Array([0x20, 0x02, enable ? 0x01 : 0x00]);
-        await this.writeCharacteristic(this.rxCharacteristic, vendorPayload);
-        targetsUsed.push('NUS RX (Vendor 0x2002)');
-        success = true;
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        this.addLog(`Błąd zapisu vendor payload do RX: ${msg}`);
+      if (method === 'nus-rx-vendor' && this.nativeDeviceId && this.hasNativeRxChar) {
+        try {
+          const vendorPayload = new Uint8Array([0x20, 0x02, enable ? 0x01 : 0x00]);
+          await this.writeNativeCharacteristic(NUS_RX_CHARACTERISTIC, vendorPayload);
+          targetsUsed.push('NUS RX (Vendor 0x2002 Native)');
+          success = true;
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          this.addLog(`Błąd zapisu vendor payload do RX: ${msg}`);
+        }
+      }
+    } else {
+      // Method 1: Dedicated characteristic 6e400004
+      if ((method === 'char-6e400004' || method === 'auto' || method === 'both') && this.ledCharacteristic) {
+        try {
+          await this.writeCharacteristic(this.ledCharacteristic, byteVal);
+          targetsUsed.push('char 0x6E400004');
+          success = true;
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          this.addLog(`Błąd zapisu do 0x6E400004: ${msg}`);
+        }
+      }
+
+      // Method 2: NUS RX single byte 0x01 / 0x00
+      if ((method === 'nus-rx-01' || method === 'both' || (method === 'auto' && !success)) && this.rxCharacteristic) {
+        try {
+          await this.writeCharacteristic(this.rxCharacteristic, byteVal);
+          targetsUsed.push('NUS RX (0x01/0x00)');
+          success = true;
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          this.addLog(`Błąd zapisu byte do RX: ${msg}`);
+        }
+      }
+
+      // Method 3: NUS RX vendor packet [0x20, 0x02, state]
+      if (method === 'nus-rx-vendor' && this.rxCharacteristic) {
+        try {
+          const vendorPayload = new Uint8Array([0x20, 0x02, enable ? 0x01 : 0x00]);
+          await this.writeCharacteristic(this.rxCharacteristic, vendorPayload);
+          targetsUsed.push('NUS RX (Vendor 0x2002)');
+          success = true;
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          this.addLog(`Błąd zapisu vendor payload do RX: ${msg}`);
+        }
       }
     }
 
@@ -801,9 +1036,15 @@ export class TrikiBleManager {
     await this.toggleLed(isBright);
 
     // 2. Also try writing 5-byte RGB buffer to RX if supported by firmware
-    if (this.rxCharacteristic) {
+    const buffer = new Uint8Array([0x02, cmd.r, cmd.g, cmd.b, cmd.brightness]);
+    if (Capacitor.isNativePlatform() && this.nativeDeviceId && this.hasNativeRxChar) {
       try {
-        const buffer = new Uint8Array([0x02, cmd.r, cmd.g, cmd.b, cmd.brightness]);
+        await this.writeNativeCharacteristic(NUS_RX_CHARACTERISTIC, buffer);
+      } catch {
+        // Optional
+      }
+    } else if (this.rxCharacteristic) {
+      try {
         await this.writeCharacteristic(this.rxCharacteristic, buffer);
       } catch {
         // Optional

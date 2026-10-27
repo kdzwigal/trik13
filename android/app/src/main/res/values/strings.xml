@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">TrikiScope</string>
+    <string name="title_activity_main">TrikiScope</string>
+    <string name="package_name">com.kdzwigal.trikiscope</string>
+    <string name="custom_url_scheme">com.kdzwigal.trikiscope</string>
+</resources>
