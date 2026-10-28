@@ -1,3 +1,4 @@
+# AI generated code and README
 # TrikiScope Web: Stacja Telemetryczna BLE & Dashboard 3D dla Żabka Triki (CAP001)
 
 Aplikacja webowa do bezpośredniej komunikacji, wizualizacji telemetrycznej 3D w czasie rzeczywistym oraz fuzji sensorów IMU dla krążka sensorycznego **Żabka Triki (CAP001)** z wykorzystaniem **Web Bluetooth API**.
